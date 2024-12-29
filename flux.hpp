@@ -35,8 +35,9 @@ namespace Flux {
         int64_t hidden_size;
         float eps;
 
-        void init_params(struct ggml_context* ctx, ggml_type wtype) {
-            params["scale"] = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hidden_size);
+        void init_params(struct ggml_context* ctx, std::map<std::string, enum ggml_type>& tensor_types, const std::string prefix = "") {
+            ggml_type wtype = GGML_TYPE_F32;  //(tensor_types.find(prefix + "scale") != tensor_types.end()) ? tensor_types[prefix + "scale"] : GGML_TYPE_F32;
+            params["scale"] = ggml_new_tensor_1d(ctx, wtype, hidden_size);
         }
 
     public:
@@ -115,25 +116,28 @@ namespace Flux {
                                                     struct ggml_tensor* q,
                                                     struct ggml_tensor* k,
                                                     struct ggml_tensor* v,
-                                                    struct ggml_tensor* pe) {
+                                                    struct ggml_tensor* pe,
+                                                    bool flash_attn) {
         // q,k,v: [N, L, n_head, d_head]
         // pe: [L, d_head/2, 2, 2]
         // return: [N, L, n_head*d_head]
         q = apply_rope(ctx, q, pe);  // [N*n_head, L, d_head]
         k = apply_rope(ctx, k, pe);  // [N*n_head, L, d_head]
 
-        auto x = ggml_nn_attention_ext(ctx, q, k, v, v->ne[1], NULL, false, true);  // [N, L, n_head*d_head]
+        auto x = ggml_nn_attention_ext(ctx, q, k, v, v->ne[1], NULL, false, true, flash_attn);  // [N, L, n_head*d_head]
         return x;
     }
 
     struct SelfAttention : public GGMLBlock {
     public:
         int64_t num_heads;
+        bool flash_attn;
 
     public:
         SelfAttention(int64_t dim,
                       int64_t num_heads = 8,
-                      bool qkv_bias     = false)
+                      bool qkv_bias     = false,
+                      bool flash_attn   = false)
             : num_heads(num_heads) {
             int64_t head_dim = dim / num_heads;
             blocks["qkv"]    = std::shared_ptr<GGMLBlock>(new Linear(dim, dim * 3, qkv_bias));
@@ -167,9 +171,9 @@ namespace Flux {
             // x: [N, n_token, dim]
             // pe: [n_token, d_head/2, 2, 2]
             // return [N, n_token, dim]
-            auto qkv = pre_attention(ctx, x);                       // q,k,v: [N, n_token, n_head, d_head]
-            x        = attention(ctx, qkv[0], qkv[1], qkv[2], pe);  // [N, n_token, dim]
-            x        = post_attention(ctx, x);                      // [N, n_token, dim]
+            auto qkv = pre_attention(ctx, x);                                   // q,k,v: [N, n_token, n_head, d_head]
+            x        = attention(ctx, qkv[0], qkv[1], qkv[2], pe, flash_attn);  // [N, n_token, dim]
+            x        = post_attention(ctx, x);                                  // [N, n_token, dim]
             return x;
         }
     };
@@ -237,15 +241,19 @@ namespace Flux {
     }
 
     struct DoubleStreamBlock : public GGMLBlock {
+        bool flash_attn;
+
     public:
         DoubleStreamBlock(int64_t hidden_size,
                           int64_t num_heads,
                           float mlp_ratio,
-                          bool qkv_bias = false) {
+                          bool qkv_bias   = false,
+                          bool flash_attn = false)
+            : flash_attn(flash_attn) {
             int64_t mlp_hidden_dim = hidden_size * mlp_ratio;
             blocks["img_mod"]      = std::shared_ptr<GGMLBlock>(new Modulation(hidden_size, true));
             blocks["img_norm1"]    = std::shared_ptr<GGMLBlock>(new LayerNorm(hidden_size, 1e-6f, false));
-            blocks["img_attn"]     = std::shared_ptr<GGMLBlock>(new SelfAttention(hidden_size, num_heads, qkv_bias));
+            blocks["img_attn"]     = std::shared_ptr<GGMLBlock>(new SelfAttention(hidden_size, num_heads, qkv_bias, flash_attn));
 
             blocks["img_norm2"] = std::shared_ptr<GGMLBlock>(new LayerNorm(hidden_size, 1e-6f, false));
             blocks["img_mlp.0"] = std::shared_ptr<GGMLBlock>(new Linear(hidden_size, mlp_hidden_dim));
@@ -254,7 +262,7 @@ namespace Flux {
 
             blocks["txt_mod"]   = std::shared_ptr<GGMLBlock>(new Modulation(hidden_size, true));
             blocks["txt_norm1"] = std::shared_ptr<GGMLBlock>(new LayerNorm(hidden_size, 1e-6f, false));
-            blocks["txt_attn"]  = std::shared_ptr<GGMLBlock>(new SelfAttention(hidden_size, num_heads, qkv_bias));
+            blocks["txt_attn"]  = std::shared_ptr<GGMLBlock>(new SelfAttention(hidden_size, num_heads, qkv_bias, flash_attn));
 
             blocks["txt_norm2"] = std::shared_ptr<GGMLBlock>(new LayerNorm(hidden_size, 1e-6f, false));
             blocks["txt_mlp.0"] = std::shared_ptr<GGMLBlock>(new Linear(hidden_size, mlp_hidden_dim));
@@ -316,7 +324,7 @@ namespace Flux {
             auto k = ggml_concat(ctx, txt_k, img_k, 2);  // [N, n_txt_token + n_img_token, n_head, d_head]
             auto v = ggml_concat(ctx, txt_v, img_v, 2);  // [N, n_txt_token + n_img_token, n_head, d_head]
 
-            auto attn         = attention(ctx, q, k, v, pe);                          // [N, n_txt_token + n_img_token, n_head*d_head]
+            auto attn         = attention(ctx, q, k, v, pe, flash_attn);              // [N, n_txt_token + n_img_token, n_head*d_head]
             attn              = ggml_cont(ctx, ggml_permute(ctx, attn, 0, 2, 1, 3));  // [n_txt_token + n_img_token, N, hidden_size]
             auto txt_attn_out = ggml_view_3d(ctx,
                                              attn,
@@ -364,13 +372,15 @@ namespace Flux {
         int64_t num_heads;
         int64_t hidden_size;
         int64_t mlp_hidden_dim;
+        bool flash_attn;
 
     public:
         SingleStreamBlock(int64_t hidden_size,
                           int64_t num_heads,
                           float mlp_ratio = 4.0f,
-                          float qk_scale  = 0.f)
-            : hidden_size(hidden_size), num_heads(num_heads) {
+                          float qk_scale  = 0.f,
+                          bool flash_attn = false)
+            : hidden_size(hidden_size), num_heads(num_heads), flash_attn(flash_attn) {
             int64_t head_dim = hidden_size / num_heads;
             float scale      = qk_scale;
             if (scale <= 0.f) {
@@ -433,7 +443,7 @@ namespace Flux {
             auto v           = ggml_reshape_4d(ctx, qkv_vec[2], head_dim, num_heads, qkv_vec[2]->ne[1], qkv_vec[2]->ne[2]);  // [N, n_token, n_head, d_head]
             q                = norm->query_norm(ctx, q);
             k                = norm->key_norm(ctx, k);
-            auto attn        = attention(ctx, q, k, v, pe);  // [N, n_token, hidden_size]
+            auto attn        = attention(ctx, q, k, v, pe, flash_attn);  // [N, n_token, hidden_size]
 
             auto attn_mlp = ggml_concat(ctx, attn, ggml_gelu_inplace(ctx, mlp), 0);  // [N, n_token, hidden_size + mlp_hidden_dim]
             auto output   = linear2->forward(ctx, attn_mlp);                         // [N, n_token, hidden_size]
@@ -480,6 +490,7 @@ namespace Flux {
 
     struct FluxParams {
         int64_t in_channels         = 64;
+        int64_t out_channels        = 64;
         int64_t vec_in_dim          = 768;
         int64_t context_in_dim      = 4096;
         int64_t hidden_size         = 3072;
@@ -492,6 +503,7 @@ namespace Flux {
         int theta                   = 10000;
         bool qkv_bias               = true;
         bool guidance_embed         = true;
+        bool flash_attn             = true;
     };
 
     struct Flux : public GGMLBlock {
@@ -631,8 +643,7 @@ namespace Flux {
         Flux() {}
         Flux(FluxParams params)
             : params(params) {
-            int64_t out_channels = params.in_channels;
-            int64_t pe_dim       = params.hidden_size / params.num_heads;
+            int64_t pe_dim = params.hidden_size / params.num_heads;
 
             blocks["img_in"]    = std::shared_ptr<GGMLBlock>(new Linear(params.in_channels, params.hidden_size, true));
             blocks["time_in"]   = std::shared_ptr<GGMLBlock>(new MLPEmbedder(256, params.hidden_size));
@@ -646,16 +657,19 @@ namespace Flux {
                 blocks["double_blocks." + std::to_string(i)] = std::shared_ptr<GGMLBlock>(new DoubleStreamBlock(params.hidden_size,
                                                                                                                 params.num_heads,
                                                                                                                 params.mlp_ratio,
-                                                                                                                params.qkv_bias));
+                                                                                                                params.qkv_bias,
+                                                                                                                params.flash_attn));
             }
 
             for (int i = 0; i < params.depth_single_blocks; i++) {
                 blocks["single_blocks." + std::to_string(i)] = std::shared_ptr<GGMLBlock>(new SingleStreamBlock(params.hidden_size,
                                                                                                                 params.num_heads,
-                                                                                                                params.mlp_ratio));
+                                                                                                                params.mlp_ratio,
+                                                                                                                0.f,
+                                                                                                                params.flash_attn));
             }
 
-            blocks["final_layer"] = std::shared_ptr<GGMLBlock>(new LastLayer(params.hidden_size, 1, out_channels));
+            blocks["final_layer"] = std::shared_ptr<GGMLBlock>(new LastLayer(params.hidden_size, 1, params.out_channels));
         }
 
         struct ggml_tensor* patchify(struct ggml_context* ctx,
@@ -711,7 +725,8 @@ namespace Flux {
                                          struct ggml_tensor* timesteps,
                                          struct ggml_tensor* y,
                                          struct ggml_tensor* guidance,
-                                         struct ggml_tensor* pe) {
+                                         struct ggml_tensor* pe,
+                                         std::vector<int> skip_layers = std::vector<int>()) {
             auto img_in      = std::dynamic_pointer_cast<Linear>(blocks["img_in"]);
             auto time_in     = std::dynamic_pointer_cast<MLPEmbedder>(blocks["time_in"]);
             auto vector_in   = std::dynamic_pointer_cast<MLPEmbedder>(blocks["vector_in"]);
@@ -733,6 +748,10 @@ namespace Flux {
             txt = txt_in->forward(ctx, txt);
 
             for (int i = 0; i < params.depth; i++) {
+                if (skip_layers.size() > 0 && std::find(skip_layers.begin(), skip_layers.end(), i) != skip_layers.end()) {
+                    continue;
+                }
+
                 auto block = std::dynamic_pointer_cast<DoubleStreamBlock>(blocks["double_blocks." + std::to_string(i)]);
 
                 auto img_txt = block->forward(ctx, img, txt, vec, pe);
@@ -742,6 +761,9 @@ namespace Flux {
 
             auto txt_img = ggml_concat(ctx, txt, img, 1);  // [N, n_txt_token + n_img_token, hidden_size]
             for (int i = 0; i < params.depth_single_blocks; i++) {
+                if (skip_layers.size() > 0 && std::find(skip_layers.begin(), skip_layers.end(), i + params.depth) != skip_layers.end()) {
+                    continue;
+                }
                 auto block = std::dynamic_pointer_cast<SingleStreamBlock>(blocks["single_blocks." + std::to_string(i)]);
 
                 txt_img = block->forward(ctx, txt_img, vec, pe);
@@ -767,13 +789,16 @@ namespace Flux {
                                     struct ggml_tensor* x,
                                     struct ggml_tensor* timestep,
                                     struct ggml_tensor* context,
+                                    struct ggml_tensor* c_concat,
                                     struct ggml_tensor* y,
                                     struct ggml_tensor* guidance,
-                                    struct ggml_tensor* pe) {
+                                    struct ggml_tensor* pe,
+                                    std::vector<int> skip_layers = std::vector<int>()) {
             // Forward pass of DiT.
             // x: (N, C, H, W) tensor of spatial inputs (images or latent representations of images)
             // timestep: (N,) tensor of diffusion timesteps
             // context: (N, L, D)
+            // c_concat: NULL, or for (N,C+M, H, W) for Fill
             // y: (N, adm_in_channels) tensor of class labels
             // guidance: (N,)
             // pe: (L, d_head/2, 2, 2)
@@ -783,6 +808,7 @@ namespace Flux {
 
             int64_t W          = x->ne[0];
             int64_t H          = x->ne[1];
+            int64_t C          = x->ne[2];
             int64_t patch_size = 2;
             int pad_h          = (patch_size - H % patch_size) % patch_size;
             int pad_w          = (patch_size - W % patch_size) % patch_size;
@@ -791,7 +817,20 @@ namespace Flux {
             // img = rearrange(x, "b c (h ph) (w pw) -> b (h w) (c ph pw)", ph=patch_size, pw=patch_size)
             auto img = patchify(ctx, x, patch_size);  // [N, h*w, C * patch_size * patch_size]
 
-            auto out = forward_orig(ctx, img, context, timestep, y, guidance, pe);  // [N, h*w, C * patch_size * patch_size]
+            if (c_concat != NULL) {
+                ggml_tensor* masked = ggml_view_4d(ctx, c_concat, c_concat->ne[0], c_concat->ne[1], C, 1, c_concat->nb[1], c_concat->nb[2], c_concat->nb[3], 0);
+                ggml_tensor* mask   = ggml_view_4d(ctx, c_concat, c_concat->ne[0], c_concat->ne[1], 8 * 8, 1, c_concat->nb[1], c_concat->nb[2], c_concat->nb[3], c_concat->nb[2] * C);
+
+                masked = ggml_pad(ctx, masked, pad_w, pad_h, 0, 0);
+                mask   = ggml_pad(ctx, mask, pad_w, pad_h, 0, 0);
+
+                masked = patchify(ctx, masked, patch_size);
+                mask   = patchify(ctx, mask, patch_size);
+
+                img = ggml_concat(ctx, img, ggml_concat(ctx, masked, mask, 0), 0);
+            }
+
+            auto out = forward_orig(ctx, img, context, timestep, y, guidance, pe, skip_layers);  // [N, h*w, C * patch_size * patch_size]
 
             // rearrange(out, "b (h w) (c ph pw) -> b c (h ph) (w pw)", h=h_len, w=w_len, ph=2, pw=2)
             out = unpatchify(ctx, out, (H + pad_h) / patch_size, (W + pad_w) / patch_size, patch_size);  // [N, C, H + pad_h, W + pad_w]
@@ -801,20 +840,59 @@ namespace Flux {
     };
 
     struct FluxRunner : public GGMLRunner {
+        static std::map<std::string, enum ggml_type> empty_tensor_types;
+
     public:
         FluxParams flux_params;
         Flux flux;
         std::vector<float> pe_vec;  // for cache
 
         FluxRunner(ggml_backend_t backend,
-                   ggml_type wtype,
-                   SDVersion version = VERSION_FLUX_DEV)
-            : GGMLRunner(backend, wtype) {
-            if (version == VERSION_FLUX_SCHNELL) {
-                flux_params.guidance_embed = false;
+                   std::map<std::string, enum ggml_type>& tensor_types = empty_tensor_types,
+                   const std::string prefix                            = "",
+                   SDVersion version                                   = VERSION_FLUX,
+                   bool flash_attn                                     = false)
+            : GGMLRunner(backend) {
+            flux_params.flash_attn          = flash_attn;
+            flux_params.guidance_embed      = false;
+            flux_params.depth               = 0;
+            flux_params.depth_single_blocks = 0;
+            if (version == VERSION_FLUX_FILL) {
+                flux_params.in_channels = 384;
             }
+            for (auto pair : tensor_types) {
+                std::string tensor_name = pair.first;
+                if (tensor_name.find("model.diffusion_model.") == std::string::npos)
+                    continue;
+                if (tensor_name.find("guidance_in.in_layer.weight") != std::string::npos) {
+                    // not schnell
+                    flux_params.guidance_embed = true;
+                }
+                size_t db = tensor_name.find("double_blocks.");
+                if (db != std::string::npos) {
+                    tensor_name     = tensor_name.substr(db);  // remove prefix
+                    int block_depth = atoi(tensor_name.substr(14, tensor_name.find(".", 14)).c_str());
+                    if (block_depth + 1 > flux_params.depth) {
+                        flux_params.depth = block_depth + 1;
+                    }
+                }
+                size_t sb = tensor_name.find("single_blocks.");
+                if (sb != std::string::npos) {
+                    tensor_name     = tensor_name.substr(sb);  // remove prefix
+                    int block_depth = atoi(tensor_name.substr(14, tensor_name.find(".", 14)).c_str());
+                    if (block_depth + 1 > flux_params.depth_single_blocks) {
+                        flux_params.depth_single_blocks = block_depth + 1;
+                    }
+                }
+            }
+
+            LOG_INFO("Flux blocks: %d double, %d single", flux_params.depth, flux_params.depth_single_blocks);
+            if (!flux_params.guidance_embed) {
+                LOG_INFO("Flux guidance is disabled (Schnell mode)");
+            }
+
             flux = Flux(flux_params);
-            flux.init(params_ctx, wtype);
+            flux.init(params_ctx, tensor_types, prefix);
         }
 
         std::string get_desc() {
@@ -828,13 +906,18 @@ namespace Flux {
         struct ggml_cgraph* build_graph(struct ggml_tensor* x,
                                         struct ggml_tensor* timesteps,
                                         struct ggml_tensor* context,
+                                        struct ggml_tensor* c_concat,
                                         struct ggml_tensor* y,
-                                        struct ggml_tensor* guidance) {
+                                        struct ggml_tensor* guidance,
+                                        std::vector<int> skip_layers = std::vector<int>()) {
             GGML_ASSERT(x->ne[3] == 1);
             struct ggml_cgraph* gf = ggml_new_graph_custom(compute_ctx, FLUX_GRAPH_SIZE, false);
 
-            x         = to_backend(x);
-            context   = to_backend(context);
+            x       = to_backend(x);
+            context = to_backend(context);
+            if (c_concat != NULL) {
+                c_concat = to_backend(c_concat);
+            }
             y         = to_backend(y);
             timesteps = to_backend(timesteps);
             if (flux_params.guidance_embed) {
@@ -854,9 +937,11 @@ namespace Flux {
                                                    x,
                                                    timesteps,
                                                    context,
+                                                   c_concat,
                                                    y,
                                                    guidance,
-                                                   pe);
+                                                   pe,
+                                                   skip_layers);
 
             ggml_build_forward_expand(gf, out);
 
@@ -867,17 +952,19 @@ namespace Flux {
                      struct ggml_tensor* x,
                      struct ggml_tensor* timesteps,
                      struct ggml_tensor* context,
+                     struct ggml_tensor* c_concat,
                      struct ggml_tensor* y,
                      struct ggml_tensor* guidance,
                      struct ggml_tensor** output     = NULL,
-                     struct ggml_context* output_ctx = NULL) {
+                     struct ggml_context* output_ctx = NULL,
+                     std::vector<int> skip_layers    = std::vector<int>()) {
             // x: [N, in_channels, h, w]
             // timesteps: [N, ]
             // context: [N, max_position, hidden_size]
             // y: [N, adm_in_channels] or [1, adm_in_channels]
             // guidance: [N, ]
             auto get_graph = [&]() -> struct ggml_cgraph* {
-                return build_graph(x, timesteps, context, y, guidance);
+                return build_graph(x, timesteps, context, c_concat, y, guidance, skip_layers);
             };
 
             GGMLRunner::compute(get_graph, n_threads, false, output, output_ctx);
@@ -917,7 +1004,7 @@ namespace Flux {
                 struct ggml_tensor* out = NULL;
 
                 int t0 = ggml_time_ms();
-                compute(8, x, timesteps, context, y, guidance, &out, work_ctx);
+                compute(8, x, timesteps, context, NULL, y, guidance, &out, work_ctx);
                 int t1 = ggml_time_ms();
 
                 print_ggml_tensor(out);
@@ -929,7 +1016,7 @@ namespace Flux {
             // ggml_backend_t backend    = ggml_backend_cuda_init(0);
             ggml_backend_t backend           = ggml_backend_cpu_init();
             ggml_type model_data_type        = GGML_TYPE_Q8_0;
-            std::shared_ptr<FluxRunner> flux = std::shared_ptr<FluxRunner>(new FluxRunner(backend, model_data_type));
+            std::shared_ptr<FluxRunner> flux = std::shared_ptr<FluxRunner>(new FluxRunner(backend));
             {
                 LOG_INFO("loading from '%s'", file_path.c_str());
 

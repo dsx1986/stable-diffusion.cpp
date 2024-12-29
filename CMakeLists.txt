@@ -24,20 +24,20 @@ endif()
 # general
 #option(SD_BUILD_TESTS                "sd: build tests"    ${SD_STANDALONE})
 option(SD_BUILD_EXAMPLES             "sd: build examples" ${SD_STANDALONE})
-option(SD_CUBLAS                     "sd: cuda backend" OFF)
+option(SD_CUDA                       "sd: cuda backend" OFF)
 option(SD_HIPBLAS                    "sd: rocm backend" OFF)
 option(SD_METAL                      "sd: metal backend" OFF)
 option(SD_VULKAN                     "sd: vulkan backend" OFF)
 option(SD_SYCL                       "sd: sycl backend" OFF)
-option(SD_FLASH_ATTN                 "sd: use flash attention for x4 less memory usage" OFF)
+option(SD_MUSA                       "sd: musa backend" OFF)
 option(SD_FAST_SOFTMAX               "sd: x1.5 faster softmax, indeterministic (sometimes, same seed don't generate same image), cuda only" OFF)
 option(SD_BUILD_SHARED_LIBS          "sd: build shared libs" OFF)
 #option(SD_BUILD_SERVER               "sd: build server example"                           ON)
 
-if(SD_CUBLAS)
-    message("-- Use CUBLAS as backend stable-diffusion")
+if(SD_CUDA)
+    message("-- Use CUDA as backend stable-diffusion")
     set(GGML_CUDA ON)
-    add_definitions(-DSD_USE_CUBLAS)
+    add_definitions(-DSD_USE_CUDA)
 endif()
 
 if(SD_METAL)
@@ -55,20 +55,24 @@ endif ()
 if (SD_HIPBLAS)
     message("-- Use HIPBLAS as backend stable-diffusion")
     set(GGML_HIPBLAS ON)
-    add_definitions(-DSD_USE_CUBLAS)
+    add_definitions(-DSD_USE_CUDA)
     if(SD_FAST_SOFTMAX)
         set(GGML_CUDA_FAST_SOFTMAX ON)
     endif()
 endif ()
 
-if(SD_FLASH_ATTN)
-    message("-- Use Flash Attention for memory optimization")
-    add_definitions(-DSD_USE_FLASH_ATTENTION)
+if(SD_MUSA)
+    message("-- Use MUSA as backend stable-diffusion")
+    set(GGML_MUSA ON)
+    add_definitions(-DSD_USE_CUBLAS)
+    if(SD_FAST_SOFTMAX)
+        set(GGML_CUDA_FAST_SOFTMAX ON)
+    endif()
 endif()
 
 set(SD_LIB stable-diffusion)
 
-file(GLOB SD_LIB_SOURCES 
+file(GLOB SD_LIB_SOURCES
     "*.h"
     "*.cpp"
     "*.hpp"
